@@ -1,0 +1,64 @@
+# Conda env for RoboFQE (from-scratch and DINOv3 FQE on LIBERO).
+#
+#   - transformers 5.8.1: DINOv3 (`model_type=dinov3_vit`) needs >= 4.55.
+#     LIBERO only uses BERT AutoModel/AutoTokenizer + logging/pipeline, which
+#     are unaffected by the bump from LIBERO's upstream 4.21.1 pin.
+#   - LIBERO + its full pin set: `LIBEROPolicyWrapper` imports
+#     `libero.lifelong.models.get_policy_class` at runtime to load BC ckpts.
+#
+# Setup (LIBERO must be cloned to ./LIBERO first, see README):
+#   conda env create -f environment.yml
+#   conda activate robofqe
+
+name: robofqe
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # ---- PyTorch (CUDA 12.8 wheels) ----
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.7.0
+      - torchvision==0.22.0
+
+      # ---- LIBERO upstream pins ----
+      - hydra-core==1.2.0
+      - numpy==1.22.4
+      - einops==0.4.1
+      - opencv-python==4.6.0.66
+      - robomimic==0.2.0
+      - robosuite==1.4.0
+      - bddl==1.0.1
+      - mujoco==3.1.6
+      - gym==0.25.2
+      - cloudpickle==2.1.0
+      - easydict==1.9
+      - future==0.18.2
+
+      # ---- DINOv3-aware transformers ----
+      # DINOv3 (`model_type=dinov3_vit`) was added to transformers around
+      # 4.55; 5.x is the first stable line that recognizes it across the
+      # AutoModel registry.  LIBERO only uses BERT AutoModel/Tokenizer +
+      # logging/pipeline — stable API, unaffected by the major bump.
+      # Verified 2026-05-19 in OZ00MS2: bert-base-cased pooling works, and
+      # `libero.lifelong.models` imports cleanly.
+      - transformers==5.8.1
+      - huggingface_hub==1.15.0
+      - tokenizers==0.22.2
+
+      # ---- LoRA-on-DINOv3 path (fqe.pretrained w/ use_lora=True) ----
+      # peft wraps the frozen HF backbone with trainable rank-r LoRA adapters;
+      # FQE TD loss drives them jointly with the head.  accelerate is a peft
+      # transitive dep (not used by our training loop directly).
+      - peft==0.19.1
+      - accelerate==1.13.0
+
+      # ---- FQE data / IO ----
+      - h5py==3.15.1
+      - PyYAML==6.0.3
+      - tqdm==4.67.1
+      - safetensors==0.4.5
+
+      # ---- LIBERO (editable; cloned into ./LIBERO, see README) ----
+      - -e ./LIBERO

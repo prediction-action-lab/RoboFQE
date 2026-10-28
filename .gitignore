@@ -1,0 +1,28 @@
+# Experiment data, BC ckpts, FQE results, caches (see README "Data").
+experiments/
+
+# LIBERO is cloned into ./LIBERO and installed editable (see README "Setup").
+/LIBERO/
+
+# Credentials
+hf_token
+.env
+
+# Large / binary files
+*.hdf5
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor / tool metadata
+.claude/
+.vscode/
+.idea/
