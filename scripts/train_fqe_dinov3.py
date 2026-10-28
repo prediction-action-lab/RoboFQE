@@ -55,6 +55,16 @@ def main():
     ap.add_argument("--ckpt-name", default="multitask_model_ep50.pth")
     ap.add_argument("--encoder", default="dinov3_vits16",
                     help="See fqe.pretrained.encoders.build_pretrained_encoder.")
+    ap.add_argument("--rollout-dir", default=None,
+                    help="Augmented rollouts (scripts/collect_rollouts.py) added "
+                         "to the demos. Default: "
+                         "experiments/libero_{suite}/data/libero_{suite}_rollouts")
+    ap.add_argument("--rollout-reward-key", default="rewards",
+                    help="Rollout reward dataset: 'rewards' = LRM labels "
+                         "(scripts/label_rewards_lrm.py), 'sim_rewards' = "
+                         "simulator ground truth.")
+    ap.add_argument("--demos-only", action="store_true",
+                    help="Train on the official demos alone (App. A.4 ablation).")
     ap.add_argument("--n-steps", type=int, default=50000)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-4,
@@ -92,6 +102,8 @@ def main():
         ap.error("--backbone-lr is only used with --mode partial")
     if args.mode == "partial" and args.n_finetune_blocks <= 0:
         ap.error("--mode partial needs --n-finetune-blocks > 0")
+    if args.demos_only and args.rollout_dir:
+        ap.error("--demos-only and --rollout-dir are mutually exclusive")
     grad_clip = (
         args.grad_clip if args.grad_clip is not None
         else DEFAULT_GRAD_CLIP[args.mode]
@@ -106,6 +118,21 @@ def main():
 
     P = get_paths(args.suite, args.policy_config)
     policy_ckpt = P["bc_ckpt_dir"] / args.ckpt_name
+
+    # Offline dataset: demos + augmented rollouts (paper setting) or demos only.
+    if args.demos_only:
+        rollout_dir, data_tag = None, "demos"
+    else:
+        rollout_dir = Path(args.rollout_dir) if args.rollout_dir else P["rollout_dir"]
+        if not rollout_dir.is_dir():
+            ap.error(f"no rollouts at {rollout_dir}: collect them with "
+                     f"scripts/collect_rollouts.py, or pass --demos-only")
+        data_tag = (
+            "aug" if args.rollout_reward_key == "rewards"
+            else f"aug-{args.rollout_reward_key}"
+        )
+        if rollout_dir.resolve() != P["rollout_dir"].resolve():
+            data_tag += f"@{rollout_dir.resolve().name}"
 
     # Bake mode-specific hparams into the save_dir name so concurrent sweeps
     # don't collide and post-hoc analysis can grep the config out of the path.
@@ -150,7 +177,7 @@ def main():
         )
     cfg_tag = args.policy_config or "legacy"
     ckpt_tag = args.ckpt_name.replace(".pth", "") + f"_gamma{args.gamma:g}_seed{args.seed}"
-    save_dir = P["fqe_results"] / method_tag / cfg_tag / ckpt_tag
+    save_dir = P["fqe_results"] / method_tag / cfg_tag / data_tag / ckpt_tag
     save_dir.mkdir(parents=True, exist_ok=True)
 
     tag = f"[fqe-dinov3-{args.mode}]"
@@ -158,6 +185,8 @@ def main():
     print(f"{tag} encoder      = {args.encoder} ({mode_desc})")
     print(f"{tag} lr / clip    = {args.lr:g} / {grad_clip}")
     print(f"{tag} policy_ckpt  = {policy_ckpt}")
+    print(f"{tag} rollouts     = {rollout_dir} (reward key '{args.rollout_reward_key}')"
+          if rollout_dir else f"{tag} rollouts     = none (demos only)")
     print(f"{tag} save_dir     = {save_dir}")
 
     dataset = libero_to_ope(
@@ -166,6 +195,8 @@ def main():
         image_keys=("agentview_rgb", "eye_in_hand_rgb"),
         lowdim_keys=("gripper_states", "joint_states"),
         bert_cache_dir=str(P["bert_cache"]),
+        rollout_dir=str(rollout_dir) if rollout_dir else None,
+        rollout_reward_key=args.rollout_reward_key,
     )
     policy = LIBEROPolicyWrapper(str(policy_ckpt))
 

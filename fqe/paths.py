@@ -5,6 +5,9 @@ Each LIBERO experiment lives under
 and shared per-tool caches under
     $ROBOFQE_ROOT/experiments/_shared/{bert, ...}/
 
+`data/` holds the official demos (`libero_{suite}/`) and the augmented BC
+rollouts written by `scripts/collect_rollouts.py` (`libero_{suite}_rollouts/`).
+
 `ROBOFQE_ROOT` defaults to the repo root.
 
 `get_paths(suite, policy_config)` returns a dict of absolute paths so each
@@ -36,6 +39,7 @@ def get_paths(suite: str, policy_config: str = "") -> Dict[str, Path]:
         "root": ROOT,
         "suite_root": suite_root,
         "dataset_dir": suite_root / "data" / f"libero_{suite}",
+        "rollout_dir": suite_root / "data" / f"libero_{suite}_rollouts",
         "bc_ckpt_dir": bc_dir,
         "fqe_results": suite_root / "fqe_results",
         "bert_cache": ROOT / "experiments" / "_shared" / "bert",

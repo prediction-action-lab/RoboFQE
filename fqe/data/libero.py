@@ -10,9 +10,15 @@ Differences from `robomimic_to_ope`:
   - task_emb (BERT-encoded language) attached per-transition; required by
     LIBEROPolicyWrapper and the vision Q-network.
   - No `policy_checkpoint_path` metadata (no behavior policy in demos) — DM only.
+  - Optional augmented rollouts (`scripts/collect_rollouts.py`): per task,
+    `{task}_rollouts.hdf5` matching the demos' `{task}_demo.hdf5`, same
+    layout, loaded under the demo file's task id. Their terminal reward is
+    read from `rollout_reward_key` ("rewards" = LRM labels written by
+    `scripts/label_rewards_lrm.py`, "sim_rewards" = simulator ground truth).
 
-Ported verbatim from opebench/datasets/libero_dataset.py
-of RoboOPE main commit 6c2c61a (author: Sangwoo Shin <jsw7460@gmail.com>).
+Ported from opebench/datasets/libero_dataset.py of RoboOPE main commit
+6c2c61a (author: Sangwoo Shin <jsw7460@gmail.com>); the rollout loading was
+added for the release.
 """
 import glob
 import os
@@ -62,6 +68,9 @@ class LIBEROOPEDataset(Dataset):
         lowdim_keys: Sequence[str] = DEFAULT_LOWDIM_KEYS,
         image_size: int = 128,
         max_demos_per_task: Optional[int] = None,
+        rollout_paths: Optional[Sequence[Optional[str]]] = None,
+        rollout_reward_key: str = "rewards",
+        max_rollouts_per_task: Optional[int] = None,
     ):
         """
         Args:
@@ -73,11 +82,22 @@ class LIBEROOPEDataset(Dataset):
             lowdim_keys: low-dim obs keys (must match policy's extra_encoder modalities).
             image_size: Expected H==W of RGB inputs (sanity check only).
             max_demos_per_task: Optional cap, useful for fast iteration / debugging.
+            rollout_paths: Optional augmented-rollout HDF5 per task, aligned
+                with `hdf5_paths` (None = no rollouts for that task).
+            rollout_reward_key: Per-step reward dataset read from rollout
+                episodes ("rewards" = LRM labels, "sim_rewards" = simulator
+                ground truth). Demos always use "rewards".
+            max_rollouts_per_task: Optional cap on rollouts per task.
         """
         assert len(hdf5_paths) == task_embeddings.shape[0], (
             f"hdf5_paths ({len(hdf5_paths)}) must match task_embeddings rows "
             f"({task_embeddings.shape[0]})"
         )
+        if rollout_paths is not None:
+            assert len(rollout_paths) == len(hdf5_paths), (
+                f"rollout_paths ({len(rollout_paths)}) must align with "
+                f"hdf5_paths ({len(hdf5_paths)})"
+            )
         self.hdf5_paths = list(hdf5_paths)
         self.task_embeddings = task_embeddings.float()  # (n_tasks, D_emb)
         self.frame_stack = int(frame_stack)
@@ -92,9 +112,23 @@ class LIBEROOPEDataset(Dataset):
 
         for task_id, hdf5_path in enumerate(self.hdf5_paths):
             self._load_one_task(task_id, hdf5_path, max_demos_per_task)
+        n_demo_trajs = len(self.trajectories)
+        self.rollout_paths = list(rollout_paths) if rollout_paths is not None else []
+        for task_id, rollout_path in enumerate(self.rollout_paths):
+            if rollout_path is not None:
+                self._load_one_task(
+                    task_id, rollout_path, max_rollouts_per_task,
+                    reward_key=rollout_reward_key,
+                )
+        self.num_rollout_trajectories = len(self.trajectories) - n_demo_trajs
 
+        rollout_msg = (
+            f" ({self.num_rollout_trajectories} augmented rollouts, "
+            f"reward key '{rollout_reward_key}')"
+            if self.num_rollout_trajectories else ""
+        )
         print(
-            f"[LIBEROOPEDataset] loaded {len(self.trajectories)} trajectories, "
+            f"[LIBEROOPEDataset] loaded {len(self.trajectories)} trajectories{rollout_msg}, "
             f"{len(self.transition_index)} transitions across {len(self.hdf5_paths)} tasks "
             f"(frame_stack={self.frame_stack})"
         )
@@ -102,6 +136,8 @@ class LIBEROOPEDataset(Dataset):
         # OPEDataset-compatible attrs (used by base trainer / algorithm)
         self.metadata = {
             "dataset_paths": self.hdf5_paths,
+            "rollout_paths": self.rollout_paths,
+            "rollout_reward_key": rollout_reward_key if self.num_rollout_trajectories else None,
             "image_keys": self.image_keys,
             "lowdim_keys": self.lowdim_keys,
             "frame_stack": self.frame_stack,
@@ -114,7 +150,10 @@ class LIBEROOPEDataset(Dataset):
         self.state_mean: Dict = {}
         self.state_std: Dict = {}
 
-    def _load_one_task(self, task_id: int, hdf5_path: str, cap: Optional[int]):
+    def _load_one_task(
+        self, task_id: int, hdf5_path: str, cap: Optional[int],
+        reward_key: str = "rewards",
+    ):
         with h5py.File(hdf5_path, "r") as f:
             demo_keys = sorted(
                 [k for k in f["data"].keys() if k.startswith("demo_")],
@@ -125,8 +164,15 @@ class LIBEROOPEDataset(Dataset):
 
             for demo_key in demo_keys:
                 d = f["data"][demo_key]
+                if reward_key not in d:
+                    raise KeyError(
+                        f"{os.path.basename(hdf5_path)}/{demo_key} has no "
+                        f"'{reward_key}' dataset. Augmented rollouts get "
+                        f"'rewards' from scripts/label_rewards_lrm.py; "
+                        f"simulator ground truth is in 'sim_rewards'."
+                    )
                 actions = np.asarray(d["actions"][:], dtype=np.float32)
-                rewards = np.asarray(d["rewards"][:], dtype=np.float32)
+                rewards = np.asarray(d[reward_key][:], dtype=np.float32)
                 dones = np.asarray(d["dones"][:], dtype=np.float32)
                 T = actions.shape[0]
 
@@ -276,6 +322,38 @@ def find_libero_task_files(dataset_dir) -> List[str]:
     return files
 
 
+def find_libero_rollout_files(rollout_dir, demo_paths: Sequence[str]) -> List[Optional[str]]:
+    """Augmented-rollout file of each demo file, aligned with `demo_paths`.
+
+    `scripts/collect_rollouts.py` writes `{task}_rollouts.hdf5` for the demo
+    file `{task}_demo.hdf5`; matching on that name gives each rollout file the
+    task id (and BERT embedding) of its demos. `rollout_dir` may be a single
+    path or a list/tuple of paths, like `find_libero_task_files`. Tasks
+    without a rollout file map to None (with a warning).
+    """
+    dirs = list(rollout_dir) if isinstance(rollout_dir, (list, tuple)) else [rollout_dir]
+    dirs = [os.path.expanduser(d) for d in dirs]
+    out: List[Optional[str]] = []
+    for demo_path in demo_paths:
+        name = os.path.basename(demo_path).replace("_demo.hdf5", "_rollouts.hdf5")
+        hits = [os.path.join(d, name) for d in dirs if os.path.isfile(os.path.join(d, name))]
+        if len(hits) > 1:
+            raise ValueError(f"{name} found in several rollout dirs: {hits}")
+        out.append(hits[0] if hits else None)
+    if all(p is None for p in out):
+        raise FileNotFoundError(
+            f"No *_rollouts.hdf5 matching the demo files under {dirs} "
+            f"(collect them with scripts/collect_rollouts.py)"
+        )
+    missing = [os.path.basename(p) for p, r in zip(demo_paths, out) if r is None]
+    if missing:
+        print(
+            f"[find_libero_rollout_files] WARNING: no rollouts for "
+            f"{len(missing)} task(s): {missing}"
+        )
+    return out
+
+
 def libero_task_descriptions_from_hdf5(hdf5_paths: Sequence[str]) -> List[str]:
     """Extract the task language description from each HDF5's `problem_info` attr."""
     import json
@@ -338,6 +416,9 @@ def libero_to_ope(
     embedding_format: str = "bert",
     bert_cache_dir: str = "./bert",
     max_demos_per_task: Optional[int] = None,
+    rollout_dir=None,
+    rollout_reward_key: str = "rewards",
+    max_rollouts_per_task: Optional[int] = None,
 ) -> LIBEROOPEDataset:
     """High-level builder: dataset_dir → LIBEROOPEDataset.
 
@@ -345,8 +426,14 @@ def libero_to_ope(
     (multi-suite combined dataset).
     Discovers `*_demo.hdf5` under the given dir(s), reads their language
     descriptions, computes BERT embeddings once, and builds the dataset.
+    `rollout_dir` (optional, path or list of paths) adds each task's
+    augmented rollouts, see `find_libero_rollout_files`.
     """
     hdf5_paths = find_libero_task_files(dataset_dir)
+    rollout_paths = (
+        find_libero_rollout_files(rollout_dir, hdf5_paths)
+        if rollout_dir is not None else None
+    )
     descriptions = libero_task_descriptions_from_hdf5(hdf5_paths)
     print(f"[libero_to_ope] {len(hdf5_paths)} task files; computing task embeddings...")
     task_embeddings = compute_libero_task_embeddings(
@@ -359,4 +446,7 @@ def libero_to_ope(
         image_keys=image_keys,
         lowdim_keys=lowdim_keys,
         max_demos_per_task=max_demos_per_task,
+        rollout_paths=rollout_paths,
+        rollout_reward_key=rollout_reward_key,
+        max_rollouts_per_task=max_rollouts_per_task,
     )

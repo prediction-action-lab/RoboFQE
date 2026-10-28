@@ -1,9 +1,10 @@
 # RoboFQE
 
 Vision-based Fitted Q Evaluation (FQE) for off-policy evaluation of LIBERO BC
-policies. Given a target BC policy and the suite's demonstration data, FQE
-fits Q^π from frame-stacked camera observations and reports the direct-method
-(DM) estimate V̂^π = E_{s₀, a∼π}[Q(s₀, a)].
+policies. Given a target BC policy and an offline dataset (the suite's
+demonstrations plus augmented rollouts of other behavior policies, labeled by
+an LRM success detector), FQE fits Q^π from frame-stacked camera observations
+and reports the direct-method (DM) estimate V̂^π = E_{s₀, a∼π}[Q(s₀, a)].
 
 Two variants share the same dataset, policy wrapper, trainer, temporal
 aggregator and Q-head; they differ only in the per-camera image encoder:
@@ -45,7 +46,9 @@ Supported encoder tags: `dinov3_vits16` (default), `dinov3_vitb16`,
 ```
 fqe/
 ├── base.py             BaseOPEAlgorithm, PolicyWrapper, set_seed
-├── data/libero.py      LIBERO HDF5 → frame-stacked transitions + BERT task_emb
+├── data/libero.py      LIBERO HDF5 (demos + augmented rollouts) → frame-stacked transitions + BERT task_emb
+├── rollouts.py         behavior policies (BC / noisy BC / random), LIBERO episodes → demo-format HDF5
+├── lrm.py              LRM success detector: prompt, answer format, loading (labeling + fine-tuning)
 ├── policy.py           LIBEROPolicyWrapper (BC ckpt → π(a | frame stack, task_emb))
 ├── trainer.py          OPETrainer (train loop, periodic DM eval, checkpoints)
 ├── libero_patches.py   runtime patch so no-proprio BC ckpts load on upstream LIBERO
@@ -53,6 +56,9 @@ fqe/
 ├── scratch/            from-scratch ResNet-18 Q-net + FQE
 └── pretrained/         DINOv3 encoders + Q-net + FQE
 scripts/
+├── collect_rollouts.py     offline-dataset augmentation (rollouts of mixed behavior policies)
+├── finetune_lrm.py         LoRA fine-tune of LRM's completion model on the official demos
+├── label_rewards_lrm.py    LRM terminal-success labels → rollout `rewards`
 ├── train_fqe_scratch.py
 └── train_fqe_dinov3.py
 ```
@@ -81,8 +87,10 @@ The scripts resolve paths with `fqe.paths.get_paths`, rooted at `$ROBOFQE_ROOT`
 ```
 experiments/
 ├── _shared/bert/                          bert-base-cased cache (auto-downloaded)
+├── _shared/lrm_libero_lora/               LRM LoRA adapter (scripts/finetune_lrm.py)
 └── libero_{suite}/                        suite ∈ spatial, object, goal, 10, 90
     ├── data/libero_{suite}/*_demo.hdf5    official LIBERO demos (128×128)
+    ├── data/libero_{suite}_rollouts/      augmented rollouts, *_rollouts.hdf5 (see below)
     ├── bc_ckpts/{policy_config}/          LIBERO multitask BC ckpts, e.g.
     │   └── multitask_model_ep50.pth         img128_noprop/multitask_model_ep50.pth
     └── fqe_results/                       written by the training scripts
@@ -92,6 +100,70 @@ BC checkpoints are those produced by LIBERO's `libero/lifelong/main.py`
 (multitask `BCTransformerPolicy`). They must embed `cfg` with `shape_meta`.
 Checkpoints trained without proprio (`img128_noprop`) are supported through
 `fqe.libero_patches.apply_no_proprio_patch`, which both scripts apply.
+
+## Offline dataset augmentation
+
+The official demos are all successful, so FQE also trains on rollouts of other
+behavior policies. Without their failure transitions, demo-only FQE
+overestimates (paper App. A.4). The paper's LIBERO data adds 25 rollouts per
+task from partially trained BC checkpoints. The world-model baselines are
+post-trained on the same data, so `collect_rollouts.py` accepts any mix of
+behavior policies to broaden state-action coverage:
+
+```bash
+export MUJOCO_GL=egl
+
+# 1) Collect. One spec per behavior policy: NAME[@NOISE][=COUNT]
+#      NAME   random (uniform actions in [-1, 1]^7), or a BC ckpt in
+#             bc_ckpts/{policy_config}/ (or a path), e.g. LIBERO's multitask_model_ep{N}.pth
+#      @NOISE Gaussian action-noise std (BC only)
+#      =COUNT rollouts per task (all specs or none; otherwise --n-rollouts is split evenly)
+#    paper setting: 25 rollouts per task from partially trained BC checkpoints
+python scripts/collect_rollouts.py --suite spatial --policy-config img128_noprop \
+    --policies multitask_model_ep5.pth multitask_model_ep15.pth multitask_model_ep20.pth
+#    wider coverage (e.g. for the world models), kept in its own rollout dir
+#    (train FQE on it with --rollout-dir)
+python scripts/collect_rollouts.py --suite spatial --policy-config img128_noprop \
+    --policies multitask_model_ep5.pth=10 multitask_model_ep20.pth=10 \
+               multitask_model_ep20.pth@0.3=10 random=10 --init-states reset \
+    --out-dir experiments/libero_spatial/data/libero_spatial_rollouts_coverage
+
+# 2) Fine-tune LRM's completion model on the official demos (LoRA)
+python scripts/finetune_lrm.py --suites spatial object goal 10
+
+# 3) Label terminal success: writes `rewards`, reports agreement with the simulator
+python scripts/label_rewards_lrm.py --suite spatial --adapter experiments/_shared/lrm_libero_lora
+```
+
+- Episodes follow LIBERO's own evaluator. They start from the benchmark init
+  states (`--init-states reset` samples fresh ones), take 5 zero-action steps,
+  then run the BC policy's stateful `get_action` with success = env `done`.
+  The horizon is 220 / 280 / 300 / 520 steps for Spatial / Object / Goal / Long.
+  Simulator workers use the `spawn` start method; forked workers fail to create
+  EGL contexts.
+- Each task gets a `{task}_rollouts.hdf5` in the official demo layout,
+  including the per-episode `model_file` (MJCF) for re-rendering from
+  `states`. It keeps `create_dataset.py`'s alignment, where `obs[t]` is the
+  observation after `actions[t]`, so the last frame is the terminal
+  observation the detector scores. Simulator success is kept in `sim_rewards`
+  and the `success` attr. The FQE loader attaches each file to its demos' task
+  by file name.
+- The success detector is the Task Completion model of
+  [LRM](https://huggingface.co/USC-PSI-Lab/LRM-models) (Qwen3-VL-8B, ~17.5 GB in
+  bf16, public). It judges the terminal agentview frame with the model-card
+  prompt, after rotating the frame 180°. That is the OpenVLA / LeRobot LIBERO
+  orientation and the one in which LIBERO's "left" / "right" match the image.
+  LIBERO's success predicates do not match the off-the-shelf model well; for
+  example, a bowl on the plate counts as success while the gripper still holds
+  it. The paper therefore labels with LRM fine-tuned on the official LIBERO
+  demos (97.4% agreement with the simulator). `finetune_lrm.py` trains a LoRA
+  on the completion model's language layers. Frames from the last 5 steps of
+  each demo are labeled "yes" (demos end after a 10-step success hold), and
+  frames from its first 80% are labeled "no". Pass the adapter with
+  `--adapter`, or merged weights with `--model /path/to/dir`.
+- FQE training reads demos + labeled rollouts by default. `--demos-only` is the
+  demo-only ablation, and `--rollout-reward-key sim_rewards` trains on
+  simulator ground truth instead of LRM labels.
 
 ## Running
 
@@ -114,10 +186,14 @@ python scripts/train_fqe_dinov3.py --mode partial \
     --n-finetune-blocks 4 --backbone-lr 1e-5 --lr 1e-4 ...
 ```
 
-Shared defaults: 50k steps, batch 64, lr 1e-4, γ = 0.99, seed 42. Use
-`--gamma 1.0` for undiscounted return (V^π = success rate). Checkpoints go to
-`fqe_results/{method_tag}/{policy_config}/{ckpt}_gamma{γ}_seed{seed}/`, and
-the final DM estimate is printed at the end of training.
+Shared defaults: 50k steps, batch 64, lr 1e-4, γ = 0.99, seed 42, demos +
+LRM-labeled rollouts. Use `--gamma 1.0` for undiscounted return (V^π = success
+rate), `--demos-only` / `--rollout-reward-key sim_rewards` for the data
+ablations. Checkpoints go to
+`fqe_results/{method_tag}/{policy_config}/{data}/{ckpt}_gamma{γ}_seed{seed}/`
+(`{data}` ∈ `aug`, `aug-sim_rewards`, `demos`, with `@{rollout dir name}`
+appended for a non-default `--rollout-dir`), and the final DM estimate is
+printed at the end of training.
 
 ## Attribution
 
@@ -125,4 +201,5 @@ The from-scratch Q-network and FQE algorithm, the LIBERO dataset loader,
 policy wrapper and trainer were written by Sangwoo Shin
 (<jsw7460@gmail.com>) in RoboOPE commit `6c2c61a` (*feat: vision-based FQE
 and FQE-Cat for LIBERO benchmark*). They are ported here with only import
-paths rewritten. File-level docstrings record the provenance.
+paths rewritten, except that the dataset loader was extended to read the
+augmented rollouts. File-level docstrings record the provenance.

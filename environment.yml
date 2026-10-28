@@ -1,6 +1,7 @@
 # Conda env for RoboFQE (from-scratch and DINOv3 FQE on LIBERO).
 #
-#   - transformers 5.8.1: DINOv3 (`model_type=dinov3_vit`) needs >= 4.55.
+#   - transformers 5.8.1: DINOv3 (`model_type=dinov3_vit`) needs >= 4.55,
+#     Qwen3-VL (LRM success detector, scripts/label_rewards_lrm.py) >= 4.57.
 #     LIBERO only uses BERT AutoModel/AutoTokenizer + logging/pipeline, which
 #     are unaffected by the bump from LIBERO's upstream 4.21.1 pin.
 #   - LIBERO + its full pin set: `LIBEROPolicyWrapper` imports

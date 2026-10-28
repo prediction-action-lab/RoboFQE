@@ -33,6 +33,16 @@ def main():
                     help="BC ckpt subdir name (e.g. img128_prop, img128_noprop). "
                          "Empty = flat bc_ckpts/ layout.")
     ap.add_argument("--ckpt-name", default="multitask_model_ep50.pth")
+    ap.add_argument("--rollout-dir", default=None,
+                    help="Augmented rollouts (scripts/collect_rollouts.py) added "
+                         "to the demos. Default: "
+                         "experiments/libero_{suite}/data/libero_{suite}_rollouts")
+    ap.add_argument("--rollout-reward-key", default="rewards",
+                    help="Rollout reward dataset: 'rewards' = LRM labels "
+                         "(scripts/label_rewards_lrm.py), 'sim_rewards' = "
+                         "simulator ground truth.")
+    ap.add_argument("--demos-only", action="store_true",
+                    help="Train on the official demos alone (App. A.4 ablation).")
     ap.add_argument("--n-steps", type=int, default=50000)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -43,6 +53,8 @@ def main():
     ap.add_argument("--eval-interval", type=int, default=500)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+    if args.demos_only and args.rollout_dir:
+        ap.error("--demos-only and --rollout-dir are mutually exclusive")
 
     # Upstream LIBERO asserts at least one proprio modality is enabled (see
     # bc_transformer_policy.py:50). No-proprio BC ckpts (img128_noprop) need
@@ -54,18 +66,36 @@ def main():
     P = get_paths(args.suite, args.policy_config)
     policy_ckpt = P["bc_ckpt_dir"] / args.ckpt_name
 
-    # Group fqe_results by method/policy-config/ckpt so multiple runs don't
-    # collide.
+    # Offline dataset: demos + augmented rollouts (paper setting) or demos only.
+    if args.demos_only:
+        rollout_dir, data_tag = None, "demos"
+    else:
+        rollout_dir = Path(args.rollout_dir) if args.rollout_dir else P["rollout_dir"]
+        if not rollout_dir.is_dir():
+            ap.error(f"no rollouts at {rollout_dir}: collect them with "
+                     f"scripts/collect_rollouts.py, or pass --demos-only")
+        data_tag = (
+            "aug" if args.rollout_reward_key == "rewards"
+            else f"aug-{args.rollout_reward_key}"
+        )
+        if rollout_dir.resolve() != P["rollout_dir"].resolve():
+            data_tag += f"@{rollout_dir.resolve().name}"
+
+    # Group fqe_results by method/policy-config/data/ckpt so multiple runs
+    # don't collide.
     method_tag = "scratch"
     cfg_tag = args.policy_config or "legacy"
     # γ + seed encoded into save dir so re-runs with different gamma / seed
     # don't overwrite each other (matches train_fqe_dinov3.py).
     ckpt_tag = args.ckpt_name.replace(".pth", "") + f"_gamma{args.gamma:g}_seed{args.seed}"
-    save_dir = P["fqe_results"] / method_tag / cfg_tag / ckpt_tag
+    save_dir = P["fqe_results"] / method_tag / cfg_tag / data_tag / ckpt_tag
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[fqe-scratch] suite        = libero_{args.suite}")
     print(f"[fqe-scratch] policy_ckpt  = {policy_ckpt}")
+    print(f"[fqe-scratch] rollouts     = {rollout_dir} "
+          f"(reward key '{args.rollout_reward_key}')" if rollout_dir
+          else "[fqe-scratch] rollouts     = none (demos only)")
     print(f"[fqe-scratch] save_dir     = {save_dir}")
 
     dataset = libero_to_ope(
@@ -74,6 +104,8 @@ def main():
         image_keys=("agentview_rgb", "eye_in_hand_rgb"),
         lowdim_keys=("gripper_states", "joint_states"),
         bert_cache_dir=str(P["bert_cache"]),
+        rollout_dir=str(rollout_dir) if rollout_dir else None,
+        rollout_reward_key=args.rollout_reward_key,
     )
     policy = LIBEROPolicyWrapper(str(policy_ckpt))
 
