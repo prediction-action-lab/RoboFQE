@@ -10,19 +10,20 @@ much of the backbone the FQE TD loss may adapt (no separate SSL step):
            adapters (default attn q/k/v) trained jointly with the head.
   partial  Patch embedding + bottom (N - K) transformer blocks frozen; top
            `--n-finetune-blocks` K blocks + final LayerNorm + pooler train,
-           with a separate (lower) `--backbone-lr`.
+           with a separate (lower) `--backbone-lr`. Default: RoboFQE as in
+           the paper.
 
 Run (MUJOCO_GL=egl, HF_TOKEN with access to facebook/dinov3-*):
-    python scripts/train_fqe_dinov3.py --mode frozen \\
+    python scripts/train_fqe_dinov3.py --mode partial \\
         --suite object --policy-config img128_noprop \\
-        --ckpt-name multitask_model_ep50.pth --encoder dinov3_vits16
+        --ckpt-name multitask_model_ep50.pth --encoder dinov3_vits16 \\
+        --n-finetune-blocks 4 --backbone-lr 1e-5 --lr 1e-4 --grad-clip 0.5
 
     python scripts/train_fqe_dinov3.py --mode lora \\
         --lora-r 16 --lora-alpha 32 --lora-dropout 0.05 \\
         --lora-targets q_proj,k_proj,v_proj ...
 
-    python scripts/train_fqe_dinov3.py --mode partial \\
-        --n-finetune-blocks 4 --backbone-lr 1e-5 --lr 1e-4 --grad-clip 0.5 ...
+    python scripts/train_fqe_dinov3.py --mode frozen ...
 """
 from __future__ import annotations
 
@@ -49,7 +50,8 @@ def main():
     ap = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--mode", choices=list(MODES), default="frozen")
+    ap.add_argument("--mode", choices=list(MODES), default="partial",
+                    help="partial is RoboFQE as in the paper.")
     ap.add_argument("--suite", choices=list(VALID_SUITES), default="object")
     ap.add_argument("--policy-config", default="img128_noprop")
     ap.add_argument("--ckpt-name", default="multitask_model_ep50.pth")
