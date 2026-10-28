@@ -194,12 +194,3 @@ ablations. Checkpoints go to
 (`{data}` ∈ `aug`, `aug-sim_rewards`, `demos`, with `@{rollout dir name}`
 appended for a non-default `--rollout-dir`), and the final DM estimate is
 printed at the end of training.
-
-## Attribution
-
-The from-scratch Q-network and FQE algorithm, the LIBERO dataset loader,
-policy wrapper and trainer were written by Sangwoo Shin
-(<jsw7460@gmail.com>) in RoboOPE commit `6c2c61a` (*feat: vision-based FQE
-and FQE-Cat for LIBERO benchmark*). They are ported here with only import
-paths rewritten, except that the dataset loader was extended to read the
-augmented rollouts. File-level docstrings record the provenance.
